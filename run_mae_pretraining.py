@@ -13,6 +13,8 @@ from datasets import build_pretraining_dataset
 from engine_for_pretraining import train_one_epoch
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
+import wandb
+
 import modeling_pretrain
 
 
@@ -40,7 +42,7 @@ def get_args():
 
     parser.add_argument('--drop_path', type=float, default=0.0, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
-                        
+
     parser.add_argument('--normlize_target', default=True, type=bool,
                         help='normalized the target patch pixels')
 
@@ -85,8 +87,8 @@ def get_args():
     parser.add_argument('--data_path', default='/path/to/list_kinetics-400', type=str,
                         help='dataset path')
     parser.add_argument('--imagenet_default_mean_and_std', default=True, action='store_true')
-    parser.add_argument('--num_frames', type=int, default= 16)
-    parser.add_argument('--sampling_rate', type=int, default= 4)
+    parser.add_argument('--num_frames', type=int, default=16)
+    parser.add_argument('--sampling_rate', type=int, default=4)
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
@@ -132,6 +134,23 @@ def get_model(args):
 
 
 def main(args):
+    # Initialize Weights & Biases -----------------------
+    os.environ["WANDB_API_KEY"] = "3cd0fd46806f5dbb7e666990676fb3d1c75e0447"
+    wandb.init(project="VideoMAE-Pretraining", config=vars(args))
+
+    # Log model and hyperparameters
+    wandb.config.update({
+        "model": args.model,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "drop_path": args.drop_path,
+        "mask_ratio": args.mask_ratio,
+        "decoder_depth": args.decoder_depth
+    })
+
+    # -------------------------------
     utils.init_distributed_mode(args)
 
     print(args)
@@ -154,7 +173,6 @@ def main(args):
     # get dataset
     dataset_train = build_pretraining_dataset(args)
 
-
     num_tasks = utils.get_world_size()
     global_rank = utils.get_rank()
     sampler_rank = global_rank
@@ -166,7 +184,6 @@ def main(args):
         dataset_train, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
     )
     print("Sampler_train = %s" % str(sampler_train))
-
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -215,23 +232,20 @@ def main(args):
         args.weight_decay_end = args.weight_decay
     wd_schedule_values = utils.cosine_scheduler(
         args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
-    #print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
-    print(f"Weight Decay Start: {args.weight_decay}, End: {args.weight_decay_end}")
-    if wd_schedule_values:
-        print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
-    else:
-        print("Warning: Weight decay schedule is empty.")
+    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
     utils.auto_load_model(
         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
     torch.cuda.empty_cache()
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+    # --------------------------------
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch)
+
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -242,6 +256,15 @@ def main(args):
             patch_size=patch_size[0],
             normlize_target=args.normlize_target,
         )
+
+        # Log training metrics to W&B
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_stats["loss"],
+            "learning_rate": lr_schedule_values[epoch * num_training_steps_per_epoch],
+            "weight_decay": wd_schedule_values[epoch * num_training_steps_per_epoch],
+        })
+
         if args.output_dir:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
                 utils.save_model(
@@ -256,6 +279,9 @@ def main(args):
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+
+    # Finish W&B logging
+    wandb.finish()
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
